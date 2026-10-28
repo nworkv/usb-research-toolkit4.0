@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.20)
-project(usb_research_toolkit VERSION 0.3.7 LANGUAGES CXX)
+project(usb_research_toolkit VERSION 0.4.1 LANGUAGES CXX)
 
 option(USB_RESEARCH_BUILD_TESTS "Build unit tests" ON)
 option(USB_RESEARCH_BUILD_LIBUSB_HOST_TEST "Build optional libusb host exerciser if libusb is available" ON)

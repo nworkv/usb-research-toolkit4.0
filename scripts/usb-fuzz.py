@@ -26,42 +26,72 @@ CRASH_PATTERNS = re.compile(r"kernel panic|BUG: unable to handle|Oops:|general p
 def sha256(path: Path) -> str:
     h=hashlib.sha256(); h.update(path.read_bytes()); return h.hexdigest()
 
-def mutate_tree(node: Any, rng: random.Random, changed: list[str], path: str="$", budget: int=2) -> Any:
-    if budget <= 0: return node
+def mutate_tree(node: Any, rng: random.Random, changed: list[str], path: str="$", budget: int=2, max_changes: int | None = None) -> Any:
+    """Mutate at most max_changes fields during this traversal (None means no limit)."""
+    if budget <= 0 or (max_changes is not None and len(changed) >= max_changes):
+        return node
     if isinstance(node, dict):
-        for key in list(node.keys()):
+        keys=list(node.keys())
+        rng.shuffle(keys)
+        for key in keys:
+            if max_changes is not None and len(changed) >= max_changes:
+                break
             val=node[key]; p=f"{path}.{key}"
             if key in NUMERIC_FIELDS and isinstance(val, int) and not isinstance(val, bool) and rng.random() < 0.42:
                 lo,hi=NUMERIC_FIELDS[key]
                 choices=[0,1,lo,hi,max(lo,val-1),min(hi,val+1),rng.randint(lo,hi)]
-                if rng.random() < 0.2: choices.append(hi+1)
-                new=rng.choice(choices)
-                if new != val: node[key]=new; changed.append(f"{p}: {val} -> {new}")
+                # Keep values representable in their descriptor field. Research-mode
+                # semantic violations are useful; over-width integers cannot be emitted.
+                choices=[x for x in choices if lo <= x <= hi and x != val]
+                if choices:
+                    new=rng.choice(choices)
+                    node[key]=new
+                    changed.append(f"{p}: {val} -> {new}")
+                    if max_changes is not None and len(changed) >= max_changes:
+                        return node
             elif key in ("manufacturer", "product", "serial") and isinstance(val,str) and rng.random()<0.3:
                 new=val[:rng.randint(0,len(val))] if val else "LAB"
                 if new == val: new=val+"-M"
                 node[key]=new; changed.append(f"{p}: string changed")
+                if max_changes is not None and len(changed) >= max_changes: return node
             elif key.endswith("_hex") and isinstance(val,str) and len(val)>=2 and rng.random()<0.45:
                 try: b=bytearray.fromhex(val)
                 except ValueError: b=bytearray()
                 if b:
-                    i=rng.randrange(len(b)); old=b[i]; b[i]=rng.choice([0,255,old ^ (1 << rng.randrange(8))]); node[key]=b.hex(); changed.append(f"{p}[{i}]: {old:02x} -> {b[i]:02x}")
+                    i=rng.randrange(len(b)); old=b[i]
+                    options=[x for x in (0,255,old ^ (1 << rng.randrange(8))) if x != old]
+                    if options:
+                        b[i]=rng.choice(options); node[key]=b.hex(); changed.append(f"{p}[{i}]: {old:02x} -> {b[i]:02x}")
+                        if max_changes is not None and len(changed) >= max_changes: return node
             elif key in ("34:0", "33:0", "32:0") and isinstance(val,str) and len(val)>=2 and rng.random()<0.6:
                 try: b=bytearray.fromhex(val)
                 except ValueError: b=bytearray()
                 if b:
-                    i=rng.randrange(len(b)); old=b[i]; b[i]=rng.choice([0,255,old ^ (1 << rng.randrange(8))]); node[key]=b.hex(); changed.append(f"{p}[{i}]: {old:02x} -> {b[i]:02x}")
+                    i=rng.randrange(len(b)); old=b[i]
+                    options=[x for x in (0,255,old ^ (1 << rng.randrange(8))) if x != old]
+                    if options:
+                        b[i]=rng.choice(options); node[key]=b.hex(); changed.append(f"{p}[{i}]: {old:02x} -> {b[i]:02x}")
+                        if max_changes is not None and len(changed) >= max_changes: return node
             elif key == "in_payloads" and isinstance(val,dict):
-                for ep,payload in list(val.items()):
+                eps=list(val.keys()); rng.shuffle(eps)
+                for ep in eps:
+                    if max_changes is not None and len(changed) >= max_changes: return node
+                    payload=val[ep]
                     if isinstance(payload,str) and len(payload)>=2 and rng.random()<0.3:
                         try: b=bytearray.fromhex(payload)
                         except ValueError: continue
                         if b:
-                            i=rng.randrange(len(b)); old=b[i]; b[i]=old ^ (1 << rng.randrange(8)); val[ep]=b.hex(); changed.append(f"{p}.{ep}[{i}]: {old:02x} -> {b[i]:02x}")
+                            i=rng.randrange(len(b)); old=b[i]; new=old ^ (1 << rng.randrange(8))
+                            b[i]=new; val[ep]=b.hex(); changed.append(f"{p}.{ep}[{i}]: {old:02x} -> {new:02x}")
+                            if max_changes is not None and len(changed) >= max_changes: return node
             else:
-                mutate_tree(val,rng,changed,p,budget-1)
+                mutate_tree(val,rng,changed,p,budget-1,max_changes)
+                if max_changes is not None and len(changed) >= max_changes: return node
     elif isinstance(node,list):
-        for i,val in enumerate(node): mutate_tree(val,rng,changed,f"{path}[{i}]",budget-1)
+        indices=list(range(len(node))); rng.shuffle(indices)
+        for i in indices:
+            if max_changes is not None and len(changed) >= max_changes: break
+            mutate_tree(node[i],rng,changed,f"{path}[{i}]",budget-1,max_changes)
     return node
 
 def load_profile(path: Path) -> dict:
@@ -75,7 +105,7 @@ def generate(base: Path, count: int, seed: int, out_dir: Path, mutations: int) -
     original=load_profile(base); rng=random.Random(seed); out_dir.mkdir(parents=True,exist_ok=True); cases=[]
     for n in range(1,count+1):
         profile=copy.deepcopy(original); changes=[]
-        for _ in range(mutations): mutate_tree(profile,rng,changes,budget=5)
+        for _ in range(mutations): mutate_tree(profile,rng,changes,budget=5,max_changes=len(changes)+1)
         profile["profile_name"]=f"fuzz-{base.stem}-{n:05d}"
         profile.setdefault("validation",{})["mode"]="research"
         profile["validation"]["calculated_fields"]="manual"

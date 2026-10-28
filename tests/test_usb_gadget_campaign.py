@@ -51,7 +51,13 @@ with tempfile.TemporaryDirectory() as td:
     rows = [{"case": 7, "profile": "/tmp/case-00007.json", "profile_sha256": "abc",
              "run_id": "test-case-7", "status": "COMPLETED",
              "started_epoch": 1700000000.0, "ended_epoch": 1700000002.0}]
+    rows.append({"case": 8, "profile": "/tmp/case-00008.json", "profile_sha256": "def",
+                 "run_id": "test-case-8", "status": "START_FAILED",
+                 "stderr_tail": "profile validation failed"})
     queue = module.analyze_campaign_captures(capture_dir, rows, str(fake_tshark), Path(td))
-    assert len(queue) == 1 and queue[0]["case"] == 7
+    assert len(queue) == 2 and queue[0]["case"] == 7
     assert "WIRESHARK_ANOMALY_TEXT" in queue[0]["reasons"]
+    failed = next(x for x in queue if x["case"] == 8)
+    assert "GADGET_START_FAILED" in failed["reasons"]
+    assert "profile validation failed" in failed["stderr_excerpt"]
 print("usb-gadget-campaign tests passed")

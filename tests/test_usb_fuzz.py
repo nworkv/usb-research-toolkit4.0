@@ -14,6 +14,10 @@ with tempfile.TemporaryDirectory() as td:
     manifest=json.loads((out/"manifest.json").read_text())
     assert manifest["seed"]==1234 and len(manifest["cases"])==8
     assert all(Path(c["profile"]).exists() for c in cases)
+    assert all(len(c["changes"]) <= 3 for c in cases)
+    one_mutation = mod.generate(base, 5, 20261028, Path(td)/"one", 1)
+    assert all(len(c["changes"]) <= 1 for c in one_mutation)
+    assert any(len(c["changes"]) == 1 for c in one_mutation)
     # Fixed seed yields byte-for-byte identical profiles in another directory.
     out2=Path(td)/"b"; mod.generate(base,8,1234,out2,3)
     for i in range(1,9):

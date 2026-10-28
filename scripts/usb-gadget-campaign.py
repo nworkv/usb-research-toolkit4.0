@@ -283,8 +283,18 @@ def analyze_campaign_captures(capture_dir: Path | None, rows: list[dict[str, Any
                 tshark_error = f"TSHARK_ERROR:{cap.name}:{exc}"
 
     for row in rows:
-        # Cases that never got through startup do not provide meaningful host-side evidence.
-        if row.get("status") not in ("COMPLETED", "STOP_ERROR", "DEVICE_EXITED_EARLY"):
+        status = row.get("status")
+        # Startup failures are not host findings, but must remain visible for triage.
+        if status == "START_FAILED":
+            queue.append({"case": row.get("case"), "profile": row.get("profile"),
+                          "profile_sha256": row.get("profile_sha256"),
+                          "run_id": row.get("run_id"),
+                          "reasons": ["GADGET_START_FAILED", "NO_HOST_REACTION_OBSERVED"],
+                          "capture_files": [], "matched_frame_count": 0,
+                          "stderr_excerpt": str(row.get("stderr_tail", ""))[-2000:],
+                          "status": "REVIEW_REQUIRED"})
+            continue
+        if status not in ("COMPLETED", "STOP_ERROR", "DEVICE_EXITED_EARLY"):
             continue
         start = row.get("started_epoch")
         end = row.get("ended_epoch")

@@ -46,12 +46,16 @@ def main() -> int:
     runner = load_runner()
     queue = runner.analyze_campaign_captures(capture_dir, rows, args.tshark, campaign_dir)
     queue_path = campaign_dir / "review-queue.json"
-    queue_path.write_text(json.dumps({
-        "generated_at": datetime.now(timezone.utc).isoformat(timespec="milliseconds"),
-        "count": len(queue),
-        "note": "Эвристическая очередь для ручной проверки; отсутствие аномалий не доказывает отсутствие сбоя и не является полным побайтовым сравнением дескрипторов.",
-        "cases": queue,
-    }, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    try:
+        queue_path.write_text(json.dumps({
+            "generated_at": datetime.now(timezone.utc).isoformat(timespec="milliseconds"),
+            "count": len(queue),
+            "note": "Эвристическая очередь для ручной проверки; отсутствие аномалий не доказывает отсутствие сбоя и не является полным побайтовым сравнением дескрипторов.",
+            "cases": queue,
+        }, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    except PermissionError:
+        print(f"Нет прав на запись в {queue_path}. Кампания запускалась через sudo? Выполните: sudo chown -R \"$USER\":\"$(id -gn)\" {campaign_dir}", file=sys.stderr)
+        return 2
     summary_path = campaign_dir / "summary.json"
     if summary_path.is_file():
         try:
