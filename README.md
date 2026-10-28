@@ -1,513 +1,506 @@
 # USB Research Toolkit 0.4.1
 
+Документация на русском языке для лабораторного исследования USB-профилей на Raspberry Pi с использованием **только Wireshark + USBPcap на Windows-хосте**. Фаззер, Raw Gadget, `tshark`, анализ PCAPNG и все отчёты работают на Raspberry Pi/Linux.
 
+> **Используйте только собственный изолированный тестовый стенд.** Некорректные USB-дескрипторы могут приводить к отказу перечисления, переподключениям, зависанию USB-устройства или сбоям тестового хоста. Перед длинной кампанией сначала выполните базовый тест и короткий прогон. Не подключайте тестовое устройство к рабочему компьютеру.
 
-## Сбор USB-трассы, когда на тестовом хосте разрешён только Wireshark
+## 1. Что делает проект
 
-Используйте [docs/wireshark-only-host.md](docs/wireshark-only-host.md): Raspberry Pi раздаёт SMB-шару, Wireshark на Windows сохраняет PCAPNG прямо на неё, а `scripts/pcap-watch.py` на Pi автоматически индексирует завершённые файлы. На тестовом хосте не запускаются агент проекта или дополнительные скрипты. PCAPNG — это USB-трасса, не Windows Event Log и не доказательство BSOD.
+1. Генерирует вариации JSON-профиля USB-устройства с фиксированным seed.
+2. Запускает профили по одному на Raspberry Pi через Linux Raw Gadget.
+3. Сохраняет отдельную трассу и stdout/stderr для каждого случая.
+4. Сопоставляет время случаев с кадрами PCAP/PCAPNG, захваченными Wireshark/USBPcap на Windows.
+5. Создаёт очередь случаев для дополнительного ручного просмотра.
+6. Позволяет повторно запустить ранее сохранённый `case-NNNNN.json` после завершения кампании.
 
-Исследовательский стенд для USB 2.0: генерация вариативных профилей устройств, эмуляция USB-периферии на Raspberry Pi 4, запись USB-захвата на тестовом хосте и сравнение наблюдений устройства с журналом Linux/Windows.
+**Важно:** `--count 1000` означает тысячу сгенерированных вариантов одного исходного профиля, например HID Mouse, а не тысячу разных физических устройств или классов USB. Уникальность дескрипторов нужно проверять отдельно. `--mutations N` задаёт максимум N изменений полей на профиль; число фактических изменений может быть меньше.
 
-> **Статус проекта:** исследовательский прототип. C++-утилиты и автоматические тесты собираются локально. Физическое подключение к вашему Raspberry Pi 4 и тест на Windows 10 должны быть проверены отдельно. Raw Gadget — низкоуровневый отладочный интерфейс ядра Linux, а не универсальный production backend.
+Wireshark/USBPcap показывает USB-трафик, видимый на host stack. Это не системный журнал Windows и не доказательство BSOD/kernel panic. `COMPLETED` означает, что процесс Gadget продержался заданное время и штатно остановился; это не означает, что Windows приняла профиль или работала без ошибок.
 
-## Исправления v0.4.1
+## 2. Требования
 
-- `--mutations N` означает максимум N изменений полей на один профиль, а не случайную массовую порчу всего дерева.
-- Числовые значения остаются в пределах ширины поля, чтобы сериализуемые исследовательские варианты могли быть переданы устройству.
-- В режиме `research` семантически некорректные, но сериализуемые дескрипторы могут пройти к Raw Gadget только при явном `--allow-research`. Ошибки сериализации/ширины поля по-прежнему блокируют запуск. Используйте исключительно собственный изолированный стенд.
-- `START_FAILED` теперь явно попадает в очередь ручной проверки, а не теряется при анализе PCAPNG. Такой случай не считается реакцией Windows: устройство не запустилось.
+### Raspberry Pi / Linux
 
-## 1. Самое главное — одна утилита `usb-lab`
+- Raspberry Pi с поддерживаемым USB Device Controller (UDC), подключённый к тестовому ПК портом, способным работать в режиме USB device/peripheral.
+- Ядро с Raw Gadget и доступный `/dev/raw-gadget`.
+- Python 3.10+, CMake 3.20+, C++20-компилятор.
+- `tshark` для разбора сохранённых PCAPNG.
+- Samba, если Wireshark будет сохранять захваты на общую папку Pi.
 
-Удобная оболочка объединяет типовые действия и доступна на Python 3.10+:
-
-- `profiles` — список встроенных типов USB-устройств;
-- `generate` — выпуск вариативных профилей из шаблона или своего JSON;
-- `validate` — проверка профиля;
-- `probe` и `device` — диагностика и запуск USB Gadget на Raspberry Pi/Linux;
-- `capture` — захват host-stack в PCAPNG через Wireshark/TShark;
-- `normalize` — перевод PCAP/PCAPNG в JSONL;
-- `compare` — сопоставление журнала Raspberry Pi с PCAP или нормализованным журналом и создание JSON + Markdown отчётов.
-
-Запустить интерактивное меню из корня репозитория:
-
-```bash
-./usb-lab
-# или
-python scripts/usb-lab.py
-```
-
-На Windows используйте `usb-lab.cmd` или `py -3`:
-
-```powershell
-py -3 .\scripts\usb-lab.py
-```
-
-## 2. Что умеет проект
-
-### Генерация USB-профилей
-
-Встроенные шаблоны:
-
-| Короткое имя | Шаблон | Назначение и ограничения |
-|---|---|---|
-| `vendor` | `vendor-bulk` | Vendor-specific устройство с Bulk IN/OUT для тестов передачи данных |
-| `cdc` | `cdc-acm-serial` | Профиль CDC ACM с коммуникационным и data-интерфейсами; проверяйте class-запросы и привязку драйвера на целевом хосте |
-| `hid` | `hid-mouse` | HID-мышь, которая передаёт нейтральный отчёт без движения |
-| `mass-storage` | `msc-bot-descriptor-only` | **Только дескрипторы** Mass Storage BOT; не является готовым диском, потому что SCSI/BOT обработчик и backing storage пока не реализованы |
-
-Шаблоны хранятся в `profiles/templates/`. Это лабораторные примеры, а не полные копии конкретных коммерческих моделей.
-
-Генератор изменяет выбранные поля на базе шаблона: PID и ревизию, manufacturer/product/serial строки, потребление питания, адреса endpoints, размер пакета, интервал, `bcdUSB`, классы/подклассы/протоколы устройства и интерфейсов, EP0 packet size, тип передачи endpoint, атрибуты и значение конфигурации. В режиме `safe` пересчитываются предусмотренные структурные поля; фиксированный `--seed` делает набор воспроизводимым.
-
-`safe` означает корректную структуру и диапазоны полей согласно правилам текущего валидатора, но **не гарантирует совместимость с классом устройства**: например, мутация `interface-class` может изменить выбор драйвера хоста. Для обычных профилей используйте набор полей по умолчанию. Чтобы варьировать расширенный набор полей, задайте `--fields all`; проверяйте результат `usb-config validate` и используйте исследовательские изменения только на изолированном стенде.
-
-### Эмуляция устройства
-
-`usb-connect` работает на Raspberry Pi/Linux через Raw Gadget. Он обрабатывает базовые стандартные control-запросы, читает/возвращает доступные данные endpoint и пишет события в JSONL. Реальная работоспособность зависит от ядра, UDC и возможностей endpoint.
-
-### Захват и сравнение
-
-На тестовом компьютере `usb-lab capture` сохраняет `.pcapng`. `usb-lab compare` может самостоятельно нормализовать такой файл и выпустить два отчёта:
-
-- JSON: полные счётчики, пары событий, непарные сигнатуры, ошибки и явные события отключения;
-- Markdown: краткий читаемый вывод на русском языке.
-
-Итоговые статусы:
-
-- `CORRELATED` — найденные сравнимые сигнатуры совпали;
-- `PARTIAL_CORRELATION` — есть совпадения и непарные наблюдения;
-- `NO_CORRELATION` — сравнимые сигнатуры не сопоставлены;
-- `DISCONNECT_OBSERVED` — устройство явно зарегистрировало событие отключения;
-- `ERROR_OR_STALL_OBSERVED` — в журнале обнаружена ошибка/STALL/тайм-аут;
-- `NO_HOST_EVIDENCE` — нормализованный захват пуст;
-- `POSSIBLE_DISCONNECT` — некоторые host status коды совместимы с исчезновением устройства, но требуют проверки.
-
-Эти статусы помогают локализовать проблему, но не должны толковаться шире, чем позволяет источник данных.
-
-## 3. Сборка
-
-### Требования
-
-- C++20-компилятор;
-- CMake 3.20+;
-- Python 3.10+;
-- Wireshark/TShark — для захвата и импорта PCAP/PCAPNG;
-- Linux и ядро с USB Gadget/UDC/Raw Gadget — для запуска эмулируемого устройства на Raspberry Pi.
-- Необязательно: `libusb-1.0` development package для `usb-host-test`.
-
-На Raspberry Pi OS/Debian:
+На Raspberry Pi OS/Debian зависимости можно установить так:
 
 ```bash
 sudo apt update
-sudo apt install build-essential cmake python3
-# Необязательно, для usb-host-test:
-sudo apt install libusb-1.0-0-dev pkg-config
+sudo apt install build-essential cmake python3 samba tshark
 ```
 
-На Windows 10 установите CMake, Visual Studio с C++ workload, Python 3 и Wireshark с USBPcap. `usb-connect` запускается на Raspberry Pi/Linux; на Windows используются генератор/валидатор и host capture/analyzer.
+### Windows test host
 
-Собрать проект и выполнить тесты:
+- Wireshark с компонентом USBPcap.
+- Никакой USB Research Toolkit, Python-агент или дополнительная служба на Windows не требуется.
+
+## 3. Собрать проект и проверить окружение
+
+В корне репозитория на Raspberry Pi:
 
 ```bash
-python scripts/usb-lab.py build
+cd ~/usb-research-toolkit4.0
+python3 scripts/usb-lab.py build
+python3 scripts/usb-lab.py doctor
 ```
 
-Эквивалентные команды CMake:
+`build` собирает C++-утилиты и выполняет CTest. `doctor` проверяет наличие `tshark`, `usb-connect`, `/dev/raw-gadget` и UDC.
+
+Дополнительные проверки:
 
 ```bash
-cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
-cmake --build build --parallel
-ctest --test-dir build --output-on-failure
+ls -l /dev/raw-gadget
+ls -l /sys/class/udc/
+sudo build/usb-connect probe
 ```
 
-Проверить окружение:
+В выводе `probe` найди **точные** значения `UDC device name` и `Raw Gadget driver name from uevent`. Подставляй их в `--udc-device` и `--udc-driver` соответственно. Например, на некоторых стендах оба значения равны `fe980000.usb`, но не полагайся на это без проверки.
+
+Проверь исходный профиль:
 
 ```bash
-python scripts/usb-lab.py doctor
+python3 scripts/usb-lab.py validate profiles/templates/hid-mouse.json --mode strict
 ```
 
-## 4. Работа с профилями
+Если сборка, `probe`, Raw Gadget или проверка исходного профиля завершились ошибкой, **не начинай кампанию** — сначала устрани эту ошибку.
 
-### Посмотреть список
+## 4. Настроить папку для Wireshark PCAPNG
+
+Подробное описание находится в [docs/wireshark-only-host.md](docs/wireshark-only-host.md).
+
+Если SMB-шара ещё не настроена, на Pi выполни один раз, заменив `nworkv` на существующего Linux-пользователя, которому разрешена запись:
 
 ```bash
-python scripts/usb-lab.py profiles
-python scripts/usb-lab.py show --type cdc
+sudo bash scripts/setup-wireshark-share.sh /srv/usb-captures nworkv
 ```
 
-Можно посмотреть JSON напрямую в `profiles/templates/`.
-
-### Сгенерировать варианты распространённых типов
-
-10 разных лабораторных вариантов CDC ACM:
-
-```bash
-python scripts/usb-lab.py generate \
-  --type cdc --count 10 --seed 42 \
-  --mode safe --out-dir profiles/generated/cdc-session
-```
-
-20 вариантов HID:
-
-```bash
-python scripts/usb-lab.py generate \
-  --type hid --count 20 --seed 12345 \
-  --mode safe --out-dir profiles/generated/hid-session
-```
-
-Профили Mass Storage (дескрипторы; **не подключайте, ожидая рабочий диск**):
-
-```bash
-python scripts/usb-lab.py generate \
-  --type mass-storage --count 5 --seed 77 \
-  --mode safe --out-dir profiles/generated/msc-descriptor-tests
-```
-
-Варианты собственного профиля:
-
-```bash
-python scripts/usb-lab.py generate \
-  --base profiles/valid/minimal-device.json \
-  --count 20 --seed 20261023 \
-  --fields pid,revision,strings,power,endpoint-addresses,packet-size,interval \
-  --mode safe --out-dir profiles/generated/my-device
-```
-
-Группы `--fields`: `pid`, `revision`, `strings`, `manufacturer`, `product`, `serial`, `power`, `endpoint-addresses`, `packet-size`, `interval`, `bcd-usb`, `device-class`, `device-subclass`, `device-protocol`, `interface-class`, `interface-subclass`, `interface-protocol`, `ep0-packet-size`, `endpoint-transfer-type`, `configuration-attributes`, `configuration-value`. Значение `all` включает все группы; список можно передать через запятую.
-
-Режим `research` намеренно вводит одно структурное несоответствие в профиль и поэтому может приводить к отказу enumeration:
-
-```bash
-python scripts/usb-lab.py generate \
-  --type vendor --count 8 --seed 42 \
-  --mode research --out-dir profiles/generated/research-cases
-```
-
-Используйте Research mode только на изолированном тестовом хосте, которым вы управляете. Для активации такого профиля `usb-connect` требует явный флаг `--allow-research`.
-
-Проверить профиль:
-
-```bash
-python scripts/usb-lab.py validate profiles/valid/minimal-device.json
-```
-
-**VID/PID.** Значения шаблонов служат примером. Перед подключением замените их идентификаторами, использование которых разрешено для вашей лаборатории. Не выдавайте себя за существующее коммерческое устройство и не подключайте намеренно некорректные профили к чужим машинам.
-
-## 5. Настройка Raspberry Pi 4
-
-### Подключение
-
-Для режима USB device на Raspberry Pi 4 Model B используется **USB-C-разъём самой платы** — подключите его кабелем передачи данных к USB-порту тестового хоста. USB-A разъёмы Raspberry Pi остаются host-портами для периферии. При питании Pi от USB хоста проверьте, что порт обеспечивает достаточную мощность; при нестабильном питании используйте подходящий вариант питания/измерительный USB-хаб.
-
-### Диагностика
-
-```bash
-python scripts/usb-lab.py probe
-```
-
-Скрипт ничего не меняет в загрузочной конфигурации. Проверьте `/boot/firmware/config.txt` (на старых образах путь может отличаться) и режим DWC2. При необходимости параметр может выглядеть так:
-
-```ini
-dtoverlay=dwc2,dr_mode=peripheral
-```
-
-Не добавляйте строку вслепую, если есть существующий overlay или функция gadget уже управляет тем же контроллером. После изменений может потребоваться перезагрузка.
-
-Raw Gadget должен быть включён в ядре (`CONFIG_USB_RAW_GADGET`) и доступен как `/dev/raw-gadget`; UDC должен отображаться под `/sys/class/udc`. В новых образах Raspberry Pi OS сервис `rpi-usb-gadget` может уже занимать контроллер — перед запуском стенда выясните, какой gadget привязан, и не запускайте два конфликтующих backend одновременно.
-
-Команда `probe` выведет имена драйвера и устройства, которые понадобятся `usb-connect`. После проверки запустите корректный профиль:
-
-```bash
-sudo python scripts/usb-lab.py device \
-  --profile profiles/valid/minimal-device.json \
-  --udc-driver '<имя-драйвера-из-probe>' \
-  --udc-device '<имя-UDC-из-probe>' \
-  --trace runs/test-001/device.jsonl \
-  --run-id test-001
-```
-
-Остановить — `Ctrl+C`. Для генерации сначала используйте `safe` профиль, который проходит `usb-config validate`. Не используйте Research-профиль, пока не проверили восстановление платы по Ethernet/Wi-Fi/UART: ошибочная конфигурация может перестать перечисляться на тестовом хосте.
-
-## 6. Захват PCAPNG на хосте
-
-Захват запускается **на тестовом компьютере**, а не на Raspberry Pi.
-
-### Linux
-
-Установите Wireshark/TShark, подключите Pi к USB-C хоста и посмотрите интерфейсы:
-
-```bash
-tshark -D
-```
-
-Для Linux USB capture обычно подходит `usbmon0` для всех шин либо `usbmonN` для конкретной шины. Запустите захват:
-
-```bash
-python scripts/usb-lab.py capture \
-  --out runs/test-001/host-linux.pcapng --interface usbmon0
-```
-
-Если интерфейс не указан, откроется список для выбора. На Linux захват может потребовать `sudo` или настроенных прав на capture.
-
-### Windows 10
-
-Установите Wireshark с компонентом USBPcap. В PowerShell:
-
-```powershell
-py -3 .\scripts\usb-lab.py capture `
-  --out runs\test-001\host-windows.pcapng
-```
-
-Выберите USBPcap-интерфейс, соответствующий контроллеру, к которому подключён Pi. Перечень интерфейсов также показывает команда `tshark -D`. Начните захват **до подключения/переподключения устройства**, затем выполните эксперимент и остановите запись `Ctrl+C`.
-
-Полный bus capture может включать другие USB-устройства. По возможности используйте отдельный тестовый порт/контроллер и проверяйте device address в захвате.
-
-## 7. Сравнение с журналом Raspberry Pi
-
-`compare` понимает нормализованный JSONL и исходные `.pcap`/`.pcapng`. Для PCAPNG нормализация выполняется автоматически, требуется TShark.
-
-### Автоматически из PCAPNG
-
-Linux:
-
-```bash
-python scripts/usb-lab.py compare \
-  --device-trace runs/test-001/device.jsonl \
-  --host runs/test-001/host-linux.pcapng \
-  --source linux_host \
-  --out runs/test-001/report.json
-```
-
-Windows:
-
-```powershell
-py -3 .\scripts\usb-lab.py compare `
-  --device-trace runs\test-001\device.jsonl `
-  --host runs\test-001\host-windows.pcapng `
-  --source windows_host `
-  --out runs\test-001\report.json
-```
-
-Рядом с JSON будут созданы:
-
-- `report.md` — отчёт на русском для быстрого просмотра;
-- `report.host-normalized.jsonl` — нормализованные события хоста.
-
-### Вручную: PCAPNG → JSONL → сравнение
-
-```bash
-python scripts/usb-lab.py normalize \
-  --pcap runs/test-001/host-linux.pcapng \
-  --out runs/test-001/host.jsonl --source linux_host
-
-./build/usb-trace summarize runs/test-001/device.jsonl
-./build/usb-trace summarize runs/test-001/host.jsonl
-./build/usb-trace compare runs/test-001/device.jsonl runs/test-001/host.jsonl
-```
-
-Если нормализатор сообщает, что поля USB недоступны в вашей версии TShark, проверьте список полей:
-
-```bash
-tshark -G fields | grep -E 'usb\.(setup|endpoint_address|data_len|capdata)'
-```
-
-На PowerShell используйте `Select-String` вместо `grep`.
-
-## 8. Как интерпретировать расхождения
-
-Система сопоставляет:
-
-- control SETUP-запросы по `bmRequestType`, `bRequest`, `wValue`, `wIndex`, `wLength`;
-- передачи endpoint, когда в обоих источниках есть endpoint, направление, фактическая длина и идентичные доступные байты payload.
-
-Непарное наблюдение значит «в другом журнале не найдено событие с такой сигнатурой», а не автоматически «пакет потерян». Причиной могут быть разные точки наблюдения, неполный capture, адрес устройства, пропущенные payload, повторная передача или разный уровень представления.
-
-**Важное ограничение USB:** `usbmon` в Linux и USBPcap в Windows обычно регистрируют передачи на уровне USB host stack/URB. Они не являются заменой аппаратному анализатору USB 2.0 и не доказывают прохождение каждого физического токена, ACK/NAK и CRC. Для выводов о фактических транзакциях на проводе требуется подходящий аппаратный USB-анализатор.
-
-Явный `USB_DISCONNECT` в журнале Raw Gadget — сильное наблюдение о том, что отключение сообщил контроллер/ядро. Но пустой host capture сам по себе не доказывает разрыв: сначала проверьте выбранный интерфейс, наличие захвата до подключения и доступность USBPcap/usbmon.
-
-## 9. Что пока не реализовано
-
-- Mass Storage шаблон описывает дескрипторы, но не реализует BOT CBW/CSW, SCSI и образ диска; поэтому не появится полноценный рабочий USB-диск.
-- Isochronous передача в Raw Gadget backend не реализована.
-- Alternate setting ограничены текущей обработкой; перед использованием не-нулевых вариантов их поддержку нужно дописать и проверить.
-- CDC ACM является лабораторным профилем, а не гарантированно совместимым серийным адаптером для всех ОС.
-- Программа не обещает определять физическую потерю каждого пакета только по софтовому pcap.
-- Возможности endpoint и допустимые дескрипторы зависят от конкретного UDC; успешная валидация JSON не гарантирует, что контроллер может выполнить конфигурацию.
-
-## 10. Структура репозитория
+Скрипт устанавливает Samba и `tshark`. Если он сообщает:
 
 ```text
-apps/                 C++ CLI: usb-config, usb-connect, usb-trace, usb-profile-gen
-include/              общие типы и интерфейсы
-src/                  компилятор дескрипторов, Raw Gadget, trace
-profiles/templates/   шаблоны vendor, CDC ACM, HID mouse, MSC BOT descriptors
-profiles/valid/       базовый корректный профиль
-profiles/research/    профиль для демонстрации намеренной ошибки
-scripts/usb-lab.py    меню и единая командная оболочка
-scripts/              захват, нормализация PCAPNG и настройка Pi
-schemas/              JSON Schema
-runs/                 каталоги журналов и отчётов (локальные результаты)
-tests/                C++ и Python тесты
+A [usb-captures] share already exists in /etc/samba/smb.conf
 ```
 
-
-## Передача системных журналов с хоста на Raspberry Pi
-
-Добавлены `scripts/host-log-agent.py` (запускается на тестируемом Linux/Windows-хосте) и `scripts/host-log-receiver.py` (запускается на Raspberry Pi). Агент непрерывно формирует локальный JSONL и пересылает события на Pi; receiver автоматически создаёт текстовый `host-HOSTNAME.log` для сигнатурного анализа и структурированный `host-HOSTNAME.jsonl`. Настройка, запуск и ограничения описаны в [docs/host-log-collection.md](docs/host-log-collection.md). В кампании используйте `--host-log runs/host-logs/host-HOSTNAME.log --host-log-settle 6`.
-
-## Лабораторный fuzz-модуль (добавлено в сборку toolkit)
-
-`scripts/usb-fuzz.py` создаёт воспроизводимые мутации JSON-профилей и, при явном разрешении, запускает последовательную кампанию через предоставленную команду-runner. Генерация по умолчанию не подключает USB-устройство к хосту.
-
-Генерация 100 вариантов с фиксированным seed:
+он не добавляет дублирующую секцию и завершается с сообщением о необходимости ручной проверки. Это не доказывает, что существующая шара настроена правильно. Проверь её конфигурацию:
 
 ```bash
-python scripts/usb-fuzz.py generate \
-  --base profiles/templates/hid-mouse.json \
-  --count 100 --seed 20261028 --mutations 3 \
-  --out-dir runs/fuzz/hid-100
+sudo testparm -s
+sudo grep -A12 '^\[usb-captures\]' /etc/samba/smb.conf
+ls -ld /srv/usb-captures
 ```
 
-То же через общую оболочку:
+Не добавляй вторую секцию `[usb-captures]`. Исправь существующую конфигурацию вручную, если путь, пользователи или права не совпадают.
+
+Узнай IP Raspberry Pi:
 
 ```bash
-python scripts/usb-lab.py fuzz generate --base profiles/templates/hid-mouse.json --count 100 --seed 20261028 --out-dir runs/fuzz/hid-100
+hostname -I
 ```
 
-`manifest.json` сохраняет seed, хеш исходного профиля, SHA-256 каждого варианта и описание изменений. Повторный запуск с теми же входными данными даёт те же профили. Варианты получают `validation.mode=research` и `calculated_fields=manual`; перед реальным запуском проверьте, что профиль поддерживается текущим backend/UDC.
+В Проводнике Windows открой, например:
 
-Для кампании укажите **свой одноразовый тестовый runner**, который принимает путь профиля через `{profile}`, завершает каждый тест с кодом 0 при нормальном результате и ненулевым кодом при подозрении на сбой:
-
-```bash
-python scripts/usb-fuzz.py campaign \
-  --base profiles/templates/hid-mouse.json --count 100 --seed 20261028 \
-  --out-dir runs/fuzz/hid-campaign --runner 'python scripts/my_lab_runner.py --profile {profile}' \
-  --timeout 30 --confirm-lab --stop-on-crash
+```text
+\\192.168.1.20\usb-captures
 ```
 
-`--confirm-lab` обязателен для исполнения runner и означает, что целевой хост изолирован и принадлежит исследователю. `--host-log PATH` позволяет наблюдать **новые строки** в доступном файле журнала; сигнатуры вроде kernel panic/bugcheck помечаются как `SUSPECTED_FAILURE`. Тайм-аут, ненулевой exit code или сигнатура создают `reproducers/case-NNNNN/` с профилем, SHA-256, результатом runner и краткой инструкцией повторения. Отчёт кампании сохраняется в `campaign.jsonl` и `summary.json`.
+Замени IP на адрес своей Pi и используй настроенные учётные данные Samba. Держи SMB только в лабораторной сети и не публикуй TCP/445 в Интернет.
 
-**Ограничения:** модуль не может сам доказать сбой удалённой Windows/Linux-системы без надёжного внешнего монитора. Отсутствие строки в host log не означает отсутствия сбоя; тайм-аут/ошибка runner — только подозрение. Подключайте эмулируемое устройство только к выделенному тестовому хосту/виртуальной среде и не запускайте кампанию на рабочей системе.
+### Выбор интерфейса Wireshark
 
-### Автоматическая кампания на Raspberry Pi (v0.4.1)
+1. Подключи Raspberry Pi к USB-порту выделенного Windows-хоста кабелем с линиями данных.
+2. Открой Wireshark и выбери интерфейс `USBPcapN`, относящийся к тому Root Hub/контроллеру, куда подключена Pi.
+3. Начни захват **до** запуска `usb-connect`/кампании. Убери display filter, если он скрывает пакеты.
+4. После теста останови захват и сохрани уникальный `.pcapng` в папку текущей кампании на SMB-шаре.
 
-Добавлен `scripts/usb-gadget-campaign.py`: он генерирует мутации и последовательно запускает каждый профиль через `usb-connect`, держит его подключённым заданное время, посылает `SIGINT` для штатного отключения, пишет отдельную трассу и сохраняет `campaign.jsonl`/`summary.json`. Windows-хосту по-прежнему нужен только Wireshark/USBPcap; runner работает на Pi.
+USBPcap должен работать на отдельном host-компьютере Windows. `usbmon` на самой Pi обычно показывает передачи, инициированные её USB host-контроллерами, и не заменяет захват host-side трафика на ПК, где Pi выступает USB Gadget.
 
-Сначала соберите toolkit и узнайте точные значения UDC:
+## 5. Базовый тест без мутаций
+
+Перед фаззингом проверь, что Raw Gadget вообще способен запустить обычный профиль. Начни Wireshark capture на Windows, а на Pi запусти (замени имена UDC на значения `probe`):
 
 ```bash
-sudo python3 scripts/usb-lab.py build
-sudo python3 scripts/usb-lab.py probe
+mkdir -p runs/fuzz/baseline
+sudo build/usb-connect run \
+  profiles/valid/minimal-device.json \
+  --backend raw-gadget \
+  --udc-driver 'ИМЯ_ДРАЙВЕРА_ИЗ_PROBE' \
+  --udc-device 'ИМЯ_UDC_ИЗ_PROBE' \
+  --speed high \
+  --trace runs/fuzz/baseline/device.jsonl \
+  --run-id baseline-check
 ```
 
-Сначала проверьте план без подключения устройства:
+Дождись `Raw Gadget running`, подожди 10–15 секунд и останови `Ctrl+C`. Затем останови и сохрани захват в Wireshark. Проверь журнал:
 
 ```bash
+less runs/fuzz/baseline/device.jsonl
+```
+
+События `UDC_BOUND`, `CONTROL_REQUEST` и `CONTROL_RESPONSE_COMPLETE` подтверждают, что Raw Gadget видит привязку контроллера и управляющие запросы. Если они есть в журнале Pi, но PCAPNG пустой, прежде всего проверь интерфейс USBPcap/Root Hub, кабель, фильтры и время начала захвата. `not attached` в sysfs после остановки Gadget ожидаем и сам по себе не указывает на неисправность.
+
+## 6. Сначала сделай dry-run
+
+`--dry-run` генерирует профили и план, но не запускает USB Gadget. Создай новый каталог с уникальной меткой, чтобы не перезаписать старые результаты:
+
+```bash
+cd ~/usb-research-toolkit4.0
+
+UDC_DRIVER='ИМЯ_ДРАЙВЕРА_ИЗ_PROBE'
+UDC_DEVICE='ИМЯ_UDC_ИЗ_PROBE'
+STAMP=$(date +%Y%m%d-%H%M%S)
+PLAN="runs/fuzz/hid-plan-$STAMP"
+
 python3 scripts/usb-gadget-campaign.py \
   --base profiles/templates/hid-mouse.json \
-  --count 3 --seed 20261028 --mutations 1 \
-  --udc-driver 'ИМЯ_ДРАЙВЕРА' --udc-device 'ИМЯ_UDC' \
-  --out-dir runs/fuzz/smoke --dry-run
+  --count 5 \
+  --seed 20261028 \
+  --mutations 1 \
+  --udc-driver "$UDC_DRIVER" \
+  --udc-device "$UDC_DEVICE" \
+  --out-dir "$PLAN" \
+  --dry-run
 ```
 
-Реальный короткий прогон в отдельной лаборатории:
+В этом терминале переменные `UDC_DRIVER`, `UDC_DEVICE` и `PLAN` сохраняются до его закрытия. Команда выведет путь к плану.
+
+Основные файлы плана:
+
+- `case-00001.json`, `case-00002.json`, ... — сохранённые профили;
+- `manifest.json` — seed, хеш базового профиля, SHA-256 каждого варианта и список мутаций;
+- `campaign.jsonl` — записи `DRY_RUN_ONLY`;
+- `summary.json` — подтверждение, что профили сгенерированы, а запусков было `0`.
+
+### Вывести список изменений каждого профиля
+
+```bash
+python3 - "$PLAN/manifest.json" <<'PY' > "$PLAN/changes.txt"
+import json, sys
+from pathlib import Path
+
+manifest = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+print("seed:", manifest.get("seed"))
+print("base:", manifest.get("base"))
+print("base_sha256:", manifest.get("base_sha256"))
+print("count:", manifest.get("count"))
+for case in manifest.get("cases", []):
+    print(f"\ncase-{case['case']:05d}  status={case.get('status')}  sha256={case.get('sha256')}")
+    changes = case.get("changes") or []
+    if changes:
+        for change in changes:
+            print("  " + change)
+    else:
+        print("  Изменения полей не зарегистрированы")
+PY
+
+less "$PLAN/changes.txt"
+```
+
+Выйти из `less`: клавиша `q`.
+
+Отчёт отражает мутации, зарегистрированные генератором. Если нужна гарантия, что все варианты отличаются по содержимому USB-дескрипторов, дополнительно проверяй уникальность профилей: номера случаев и `profile_name` сами по себе не делают дескрипторы уникальными. Для большого запуска проверь небольшой dry-run и отчёт прежде, чем подключать тестовый хост.
+
+## 7. Короткая реальная кампания на 3–5 случаев
+
+Для настоящего запуска обязательны `--allow-research` и `--confirm-lab`. Эти флаги предназначены только для изолированного стенда с разрешённым тестированием.
+
+Сначала подготовь каталоги и переменные в том же терминале:
+
+```bash
+STAMP=$(date +%Y%m%d-%H%M%S)
+OUT="runs/fuzz/hid-smoke-$STAMP"
+CAPTURE_DIR="/srv/usb-captures/hid-smoke-$STAMP"
+
+sudo install -d -m 2770 -o "$USER" -g "$(id -gn)" "$CAPTURE_DIR"
+echo "OUT=$OUT"
+echo "CAPTURE_DIR=$CAPTURE_DIR"
+```
+
+Если Samba использует отдельного пользователя, назначь владельца каталога именно этому пользователю, чтобы Windows могла сохранять файлы.
+
+На Windows начни новый USBPcap capture. На Pi запусти:
 
 ```bash
 sudo python3 scripts/usb-gadget-campaign.py \
   --base profiles/templates/hid-mouse.json \
-  --count 5 --seed 20261028 --mutations 1 \
-  --udc-driver 'ИМЯ_ДРАЙВЕРА' --udc-device 'ИМЯ_UDC' \
+  --count 5 \
+  --seed 20261028 \
+  --mutations 1 \
+  --udc-driver "$UDC_DRIVER" \
+  --udc-device "$UDC_DEVICE" \
+  --dwell-seconds 10 \
+  --settle-seconds 3 \
+  --capture-dir "$CAPTURE_DIR" \
+  --out-dir "$OUT" \
+  --allow-research \
+  --confirm-lab
+```
+
+По умолчанию runner продолжает после ошибки отдельного случая. Если хочешь остановить кампанию при первой ошибке запуска/раннем завершении, добавь `--stop-on-error`.
+
+После завершения останови Wireshark и сохрани файл, например:
+
+```text
+\\192.168.1.20\usb-captures\hid-smoke-ВРЕМЕННАЯ_МЕТКА\campaign.pcapng
+```
+
+Используй IP и имя каталога из своего запуска. Проверь, что Pi видит файл:
+
+```bash
+find "$CAPTURE_DIR" -maxdepth 1 -type f -printf '%f %s bytes\n'
+```
+
+## 8. Запустить кампанию на 50 или 1000 вариантов
+
+Тот же runner поддерживает до 1000 случаев на одну кампанию. Сначала пройди короткий прогон выше и убедись, что профили реально доходят до Raw Gadget. Пример для 50 вариантов:
+
+```bash
+STAMP=$(date +%Y%m%d-%H%M%S)
+OUT="runs/fuzz/hid-50-$STAMP"
+CAPTURE_DIR="/srv/usb-captures/hid-50-$STAMP"
+sudo install -d -m 2770 -o "$USER" -g "$(id -gn)" "$CAPTURE_DIR"
+echo "OUT=$OUT"
+echo "CAPTURE_DIR=$CAPTURE_DIR"
+
+sudo python3 scripts/usb-gadget-campaign.py \
+  --base profiles/templates/hid-mouse.json \
+  --count 50 --seed 20261028 --mutations 1 \
+  --udc-driver "$UDC_DRIVER" --udc-device "$UDC_DEVICE" \
   --dwell-seconds 10 --settle-seconds 3 \
-  --capture-dir /srv/usb-captures \
-  --out-dir runs/fuzz/hid-smoke \
+  --capture-dir "$CAPTURE_DIR" --out-dir "$OUT" \
   --allow-research --confirm-lab
 ```
 
-`--allow-research` допускает профили с ручными/исследовательскими дескрипторами; `--confirm-lab` подтверждает, что устройство подключено только к собственному изолированному тестовому хосту. `--capture-dir` не управляет Wireshark, а лишь фиксирует изменившиеся PCAPNG-файлы и их размеры для временной корреляции. Запустите захват в Wireshark до кампании и остановите после неё. Начните с 3–5 случаев и короткой выдержки. При ошибке запуска кампания по умолчанию останавливается; `--continue-on-error` разрешает продолжать, но используйте его только если понимаете причину ошибки.
+Для 1000 вариантов измени `--count 50` на `--count 1000` и создай отдельный новый `OUT`/`CAPTURE_DIR`. При `--dwell-seconds 10` и `--settle-seconds 3` номинальное время только на выдержку/паузы — примерно 3 часа 37 минут; запуск, остановка, ошибки и разбор могут увеличить общее время. Для запуска нужна свободная консоль; не прерывай процесс, если не хочешь получить статус `INTERRUPTED`.
 
-Runner не может доказать BSOD по PCAPNG и не может надёжно обнаружить зависание Windows без внешнего сигнала. Он автоматизирует мутации, подключение/отключение устройства и сбор локальных трасс, а не подтверждение системного сбоя. Физическую совместимость с конкретным Pi/UDC нужно проверить на стенде.
+**Не запускай тысячу случаев, если smoke-тест всё ещё даёт `START_FAILED`, не видно USB-запросов или не настроен корректный PCAPNG capture.** Отказ Windows принять отдельный некорректный профиль может быть ожидаем, но это нужно отличать от ошибки запуска самого Gadget.
 
-## 11. Полезные ссылки
+## 9. Посмотреть результаты кампании
 
-- Спецификация USB 2.0: <https://www.usb.org/document-library/usb-20-specification>
-- Linux USB Raw Gadget: <https://docs.kernel.org/usb/raw-gadget.html>
-- Linux USB Gadget API: <https://docs.kernel.org/driver-api/usb/gadget.html>
-- Raspberry Pi — USB Gadget mode, поддерживаемые разъёмы: <https://www.raspberrypi.com/news/usb-gadget-mode-in-raspberry-pi-os-ssh-over-usb/>
-- Wireshark — USB capture: <https://wiki.wireshark.org/CaptureSetup/USB>
+Скрипт печатает итоговый каталог и путь к `summary.json`. Поскольку команда запускается через `sudo`, после завершения исправь права на каталог результатов:
 
+```bash
+sudo chown -R "$USER:$(id -gn)" "$OUT"
+```
 
-## 12. Исправления выпуска 0.3.2
+### Общая сводка
 
-- Собран полный чистый архив исходного проекта, без маркеров конфликтов Git.
-- Исправлены скрипт нормализации TShark и тестовые файлы для сравнения USB-захватов.
-- Нормализатор проверяет доступные поля TShark через `tshark -G fields` и поддерживает современное имя `usb.bmRequestType`, а также старое имя, если оно присутствует в установленной версии.
-- Python-скрипты проверены через `py_compile`; автоматические C++/Python-тесты запускаются через CTest.
+```bash
+python3 -m json.tool "$OUT/summary.json" | less
+```
 
-Для обновления после неудачного Git merge рекомендуется распаковать этот ZIP в новую папку и перенести туда только собственные профили и результаты из `runs/`. Не распаковывайте поверх папки с незавершённым слиянием Git.
+Наиболее важные поля:
 
+- `generated` — число сгенерированных профилей;
+- `executed` — число обработанных runner случаев;
+- `completed` — процесс Gadget выдержал заданное время и штатно завершился;
+- `startup_errors` — ошибки запуска/раннее завершение/ошибка остановки;
+- `interrupted_cases` — случаи, прерванные пользователем;
+- `review_required`, `review_queue` — размер и путь к очереди ручной проверки.
 
-## 13. Исправление Raw Gadget endpoint cleanup в версии 0.3.3
+### Результат каждого случая
 
-В версии 0.3.3 исправлена передача handle в `USB_RAW_IOCTL_EP_DISABLE`: backend передаёт числовой handle как аргумент ioctl, как ожидает реализация Linux Raw Gadget. Ранее передавался адрес переменной с handle, из-за чего ядро интерпретировало адрес как индекс endpoint и возвращало `EBUSY`; endpoint оставался включённым, а следующая enumeration могла завершаться `EBUSY` для `0x81`.
+```bash
+less "$OUT/campaign.jsonl"
+```
 
-Также добавлены отмена ожидающего endpoint I/O через thread-directed `SIGUSR1`, повтор попытки отключения после завершения worker и сохранение ошибки, если endpoint всё ещё не удалось отключить. Это исправление прошло сборку и автоматические тесты в Linux, но требует отдельной проверки на конкретном UDC/Raspberry Pi.
+Каждая строка — отдельная JSON-запись. В ней есть номер случая, путь профиля, SHA-256, временные метки, код завершения, статус, пути к логам и список изменившихся файлов захвата.
 
+Для краткого списка статусов:
 
-## 14. v0.3.4: Raw Gadget lifecycle и пустой захват Wireshark
+```bash
+python3 - "$OUT/campaign.jsonl" <<'PY'
+import json, sys
+from pathlib import Path
+for line in Path(sys.argv[1]).read_text(encoding="utf-8").splitlines():
+    if not line.strip(): continue
+    r = json.loads(line)
+    print(f"case-{r.get('case', 0):05d}  {r.get('status')}  "
+          f"{r.get('duration_seconds', '?')} s  "
+          f"sha256={r.get('profile_sha256', '?')}")
+PY
+```
 
-В v0.3.4 исправлен порядок остановки endpoint worker: сначала выставляется stop, worker ioctl прерываются сигналом `SIGUSR1` и присоединяются (`join`), после чего вызывается `USB_RAW_IOCTL_EP_DISABLE`. Ранее backend сначала пытался отключить endpoint, пока `USB_RAW_IOCTL_EP_WRITE/READ` ещё мог держать URB в очереди; Raw Gadget может отклонить такой disable.
+### Какие поля менялись
 
-`USB_RAW_EVENT_DISCONNECT` больше не считается безусловным завершением процесса. Документация Raw Gadget указывает, что драйвер `dwc2` может сообщать bus reset как `USB_RAW_EVENT_DISCONNECT`; backend очищает worker/endpoints и продолжает ждать повторную enumeration.
+В `manifest.json` сохраняется массив `changes` для каждого `case`. Создай читаемый отчёт по реальной кампании:
 
-Каждый новый `TraceLogger` теперь начинает новый JSONL-файл, а не дописывает предыдущий запуск в файл с повторяющимися sequence numbers. Для каждого запуска используйте отдельные `run-id` и имена файлов.
+```bash
+python3 - "$OUT/manifest.json" <<'PY' > "$OUT/changes.txt"
+import json, sys
+from pathlib import Path
+m = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+for c in m.get("cases", []):
+    print(f"\ncase-{c['case']:05d}  sha256={c.get('sha256')}")
+    changes = c.get("changes") or []
+    for change in changes:
+        print("  " + change)
+    if not changes:
+        print("  Изменения полей не зарегистрированы")
+PY
 
-Профиль HID Mouse обновлён: Report Descriptor теперь описывает 4-байтовый отчёт (кнопки, X, Y и колесо), что соответствует 4-байтовой IN-payload и `wMaxPacketSize=4`.
+less "$OUT/changes.txt"
+```
 
-**Почему Wireshark может быть пустым:** журнал Raw Gadget уже содержит `CONTROL_REQUEST` и `CONTROL_RESPONSE_COMPLETE` — значит, хост отправлял setup-запросы и устройство на них отвечало. Если Wireshark ничего не показывает, проверьте точку захвата. USBPcap/usbmon должны работать на отдельном тестовом HOST-компьютере, который подключён к Raspberry Pi. `usbmon` на самой Raspberry Pi обычно видит её HOST-контроллеры (например, USB-A/xHCI), но не трафик линии, на которой Pi выступает USB-Gadget через UDC. На Linux запустите `sudo modprobe usbmon`, затем `tshark -D` и захватывайте `usbmon0` или интерфейс конкретной шины. На Windows выберите USBPcap-интерфейс того host controller, к которому физически подключена Pi. Начните захват до переподключения кабеля.
+### Трассы и ошибки
 
-Все изменения используют исключительно Linux USB Raw Gadget (`/dev/raw-gadget`); ConfigFS не применяется.
+```bash
+find "$OUT/traces" -maxdepth 1 -type f -print
+```
 
-## v0.3.5: диагностика пустого захвата и Raw Gadget reset
+Для конкретного случая `N` используй номер с ведущими нулями:
 
-### Почему Wireshark может показывать пустой USB-захват
+```bash
+cat "$OUT/traces/case-00001.stdout.log"
+cat "$OUT/traces/case-00001.stderr.log"
+less "$OUT/traces/case-00001.device.jsonl"
+```
 
-`Raw Gadget` работает на стороне **USB device controller (UDC)**. Linux `usbmon` на Raspberry Pi наблюдает USB-транзакции, которые инициируют USB **host**-контроллеры самой Pi (например, её USB-A порты), а не обязательно кабель, на котором Pi играет роль USB gadget. Для программного PCAPNG запускайте захват на отдельном тестовом хосте: на Linux — `usbmonN`, на Windows — соответствующий `USBPcapN` интерфейс того контроллера, куда физически включена Pi. Начинайте capture до отключения/повторного подключения устройства и временно снимите display/capture filters. `usbmon`/USBPcap фиксируют URB/host-stack transfers, а не каждый физический token/ACK/NAK/CRC; для этого нужен аппаратный USB-анализатор.
+В `device.jsonl` ищи `UDC_BOUND`, `CONTROL_REQUEST`, `CONTROL_RESPONSE_COMPLETE`, `CONTROL_STALL`, `DEVICE_IN_TRANSFER_ERROR`, `USB_SUSPEND`, reset/disconnect события. `START_FAILED` — это прежде всего проблема запуска/валидации на Pi, не свидетельство сбоя Windows.
 
-### Изменения Raw Gadget
+## 10. Анализ PCAPNG и очередь проверки
 
-- Endpoint worker-потоки теперь останавливаются и join-ятся до `USB_RAW_IOCTL_EP_DISABLE`.
-- На `USB_RAW_EVENT_RESET` и `USB_RAW_EVENT_DISCONNECT` UDC может уже отключить endpoints. `EBUSY` в такой уборке теперь отмечается как `ENDPOINT_ALREADY_INACTIVE`, а не считается фатальным; event loop продолжает ждать enumeration. Особенно важно для DWC2, который может сообщить о reset через `DISCONNECT`.
-- IN/OUT worker-потоки запускаются только после завершения status stage `SET_CONFIGURATION`.
-- В сравнительном отчёте `USB_RESET_OR_DISCONNECT` не считается доказанным физическим отключением кабеля.
-- Новый HID mouse профиль согласует HID report length с 62-байтным report descriptor и 4-байтным отчётом (buttons, X/Y, wheel).
+После окончания кампании обязательно останови Wireshark и сохрани PCAPNG в папку, указанную `--capture-dir`. Убедись, что файл есть на Pi. Затем запусти повторный анализ **после сохранения файла**:
 
-### Проверка трафика
+```bash
+python3 scripts/review-usb-campaign.py \
+  --campaign-dir "$OUT" \
+  --capture-dir "$CAPTURE_DIR"
+```
 
-На Pi после запуска `usb-connect` журнал `device.jsonl` должен содержать `CONTROL_REQUEST` и `CONTROL_RESPONSE_COMPLETE` при enumeration, затем `SET_CONFIGURATION`, `DEVICE_IN_TRANSFER_QUEUED` и `DEVICE_IN_TRANSFER_COMPLETE` когда хост опрашивает interrupt IN endpoint. Если control-запросы есть в журнале Raw Gadget, но Wireshark пуст, сначала проверьте точку захвата/выбранный USBPcap или usbmon bus. Если нет `DEVICE_IN_TRANSFER_COMPLETE`, смотрите `DEVICE_IN_TRANSFER_ERROR`, reset/disconnect events и статус устройства в host OS.
+Открой очередь:
 
-### Короткая проверка, если в Wireshark ноль USB-кадров
+```bash
+python3 -m json.tool "$OUT/review-queue.json" | less
+```
 
-1. Убедитесь, что кабель USB-C Pi подключён к тестовому хосту, а не к USB-A порту самой Pi.
-2. На Windows запустите Wireshark от имени администратора, откройте Capture Options и выберите `USBPcapN`, соответствующий host-контроллеру физического порта. Начните capture до отключения/подключения кабеля. Без display filter проверьте VID/PID профиля (`1209:1200` для включённого шаблона HID в этом проекте; `1209:0012` встречался в прежнем тесте).
-3. На отдельном Linux-хосте выполните `sudo modprobe usbmon`, `tshark -D`, затем запишите capture с интерфейса `usbmonN`, который соответствует шине, где появился USB-девайс. `usbmon0` охватывает все host-шины.
-4. Не используйте `usbmon` на самой Pi для наблюдения DWC2 UDC-линии: он не является аппаратным ответвителем gadget-трафика. Для анализа реальных USB-токенов используйте аппаратный USB 2.0 анализатор.
-5. В `device.jsonl` наличие `CONTROL_REQUEST` подтверждает, что запрос хоста дошёл до Raw Gadget. Наличие `CONTROL_RESPONSE_COMPLETE` подтверждает завершение программной операции ответа, но не является само по себе физическим анализом ACK/CRC. После настройки конфигурации ожидайте `DEVICE_IN_TRANSFER_QUEUED`; при опросе interrupt IN хостом — `DEVICE_IN_TRANSFER_COMPLETE`.
+В очередь могут попадать:
 
+- `GADGET_START_FAILED` — профиль не запустился на Raspberry Pi;
+- `NO_CAPTURE_FRAMES_IN_CASE_WINDOW` — в захвате не нашлось кадров во временном окне случая;
+- `WIRESHARK_ANOMALY_TEXT` — в Protocol/Info обнаружен текст, похожий на reset/disconnect/stall/timeout;
+- `POSSIBLE_DECODE_OR_DESCRIPTOR_MISMATCH` — Wireshark описывает кадр как malformed/invalid/undecoded;
+- `TSHARK_NOT_FOUND`, ошибка чтения PCAPNG или неидентифицированный USB-трафик.
 
-## v0.3.6: воспроизводимые мутации и кампании
+Это **эвристический список для ручной проверки**, а не вердикт об уязвимости. Временная корреляция зависит от синхронизации часов Pi и Windows. Если PCAPNG был сохранён только после остановки кампании, первоначальный runner мог не зарегистрировать его изменение; повторный `review-usb-campaign.py` нужен именно для анализа уже сохранённого файла.
 
-- Добавлен `scripts/usb-fuzz.py`: seeded-поколение мутаций USB JSON-профилей, SHA-256, manifest и журнал последовательной кампании.
-- Добавлена команда оболочки `usb-lab.py fuzz ...`.
-- Кампания запускает только явно указанный одноразовый runner и требует `--confirm-lab`; тайм-ауты, ненулевой код возврата и распознанные host-log signatures сохраняются как подозрительные случаи с точным профилем для повторения.
-- Добавлены Python-тесты детерминизма генератора в CTest.
-- Сигнатуры в host log являются эвристикой, а не самостоятельным доказательством сбоя ОС.
+Чтобы проверить отдельный захват вручную:
 
+```bash
+tshark -r "$CAPTURE_DIR/campaign.pcapng" -q -z io,phs
+```
 
-### Очередь дополнительной проверки (v0.4.1)
+Путь заменяй на реальное имя файла. Для просмотра кадров открой PCAPNG в Wireshark на Windows или используй `tshark` на Pi.
 
-- После кампании runner создаёт `review-queue.json`: случаи с USB reset/disconnect/stall/timeout/error, признаками malformed/invalid, отсутствием кадров в окне теста или недостаточными данными.
-- Для анализа после сохранения PCAPNG запустите `scripts/review-usb-campaign.py`; это позволяет сначала завершить кампанию, затем остановить/сохранить захват Wireshark и повторно построить очередь.
-- Повтор выбранного случая выполняется через `--replay-from <каталог кампании> --replay-case <номер>` и использует исходный `case-NNNNN.json`, а не создаёт новую мутацию.
-- Анализ является эвристическим и требует синхронизации часов Pi/Windows. PCAPNG не доказывает BSOD/kernel panic и не гарантирует автоматическое побайтовое сравнение каждого ответа с профилем.
+## 11. Повторить подозрительный профиль после кампании
+
+Например, чтобы повторить случай `3`, нужно сохранить исходный каталог кампании в переменной `OUT`, как в том же терминале, либо вручную задать его точный путь. Повтор использует сохранённый `case-00003.json`, а не создаёт новую мутацию.
+
+Создай отдельный каталог повторного прогона и папку для его захвата:
+
+```bash
+CASE=3
+STAMP=$(date +%Y%m%d-%H%M%S)
+REPLAY_OUT="runs/fuzz/replay-case-$CASE-$STAMP"
+REPLAY_CAPTURE_DIR="/srv/usb-captures/replay-case-$CASE-$STAMP"
+sudo install -d -m 2770 -o "$USER" -g "$(id -gn)" "$REPLAY_CAPTURE_DIR"
+echo "REPLAY_OUT=$REPLAY_OUT"
+echo "REPLAY_CAPTURE_DIR=$REPLAY_CAPTURE_DIR"
+```
+
+Начни новый USBPcap capture в Wireshark и сохрани его в `REPLAY_CAPTURE_DIR`. Затем на Pi:
+
+```bash
+sudo python3 scripts/usb-gadget-campaign.py \
+  --base profiles/templates/hid-mouse.json \
+  --replay-from "$OUT" --replay-case "$CASE" \
+  --udc-driver "$UDC_DRIVER" --udc-device "$UDC_DEVICE" \
+  --dwell-seconds 10 --settle-seconds 0 \
+  --capture-dir "$REPLAY_CAPTURE_DIR" \
+  --out-dir "$REPLAY_OUT" \
+  --allow-research --confirm-lab
+```
+
+После окончания останови и сохрани захват, затем:
+
+```bash
+sudo chown -R "$USER:$(id -gn)" "$REPLAY_OUT"
+python3 scripts/review-usb-campaign.py \
+  --campaign-dir "$REPLAY_OUT" \
+  --capture-dir "$REPLAY_CAPTURE_DIR"
+```
+
+Не перезаписывай исходную кампанию или PCAPNG: отдельные каталоги сохраняют воспроизводимость.
+
+## 12. Частые проблемы
+
+### `START_FAILED`
+
+Смотри `$OUT/traces/case-NNNNN.stderr.log`. Частые причины: невалидный/неподдерживаемый профиль, ошибка Raw Gadget, неверные имена UDC, неподдерживаемая скорость или ошибка дескриптора. Кампания не должна рассматриваться как тест реакции Windows, если gadget не запустился.
+
+### `PermissionError` при создании отчёта
+
+Кампания запускалась через `sudo` и файлы принадлежат `root`. Выполни:
+
+```bash
+sudo chown -R "$USER:$(id -gn)" "$OUT"
+```
+
+### В `device.jsonl` есть `CONTROL_REQUEST`, но Wireshark пуст
+
+Проверь, что захват идёт на отдельном Windows-хосте и на правильном USBPcap Root Hub, что кабель подключён к этому контроллеру и захват начался до теста. Убери display filter. События в `device.jsonl` не гарантируют, что был выбран правильный интерфейс захвата.
+
+### `review-queue.json` пустой
+
+Убедись, что повторный анализ выполнен после сохранения PCAPNG и что путь `--capture-dir` указывает на каталог с этим файлом. Проверь наличие `tshark` командой `which tshark`. Пустая очередь не означает, что хост точно не столкнулся с проблемой.
+
+### `not attached` в `/sys/class/udc/.../state`
+
+Проверь состояние во время работающего `usb-connect`, например во втором терминале через `watch -n 0.5 cat /sys/class/udc/ИМЯ_UDC/state`. После остановки Gadget `not attached` — ожидаемо.
+
+## 13. Как трактовать результаты и ограничения
+
+| Наблюдение | Интерпретация |
+|---|---|
+| Windows отклонила устройство/enum не завершился | Само по себе не означает уязвимость |
+| `COMPLETED` | Процесс Gadget отработал заданное время; здоровье хоста этим не подтверждено |
+| `START_FAILED` | Тест не дошёл до полноценного прогона; расследуй локальный журнал Pi |
+| USB reset, STALL или timeout | Требует контекста кадра и поведения устройства/хоста |
+| Нет кадров в PCAPNG | Может указывать на неверный интерфейс, неподходящее окно времени или отсутствие захвата |
+| Хост перестал отвечать по сети | Только косвенный признак, не доказательство BSOD |
+| Нет подозрительных строк в Wireshark | Не доказывает отсутствие сбоя или byte-for-byte совпадение |
+
+Проект не устанавливает Windows-агент и не собирает Windows Event Log. Для подтверждения BSOD/kernel crash потребуются независимые подтверждения, например сохранённый дамп или системный журнал, но они вне конфигурации «на хосте только Wireshark». Анализатор этого проекта не делает полного побайтового сравнения каждого ответа с намеренным содержимым JSON — очередь проверки помогает отобрать случаи для ручного исследования.
+
+## 14. Другие команды `usb-lab`
+
+```bash
+python3 scripts/usb-lab.py profiles
+python3 scripts/usb-lab.py show --type hid
+python3 scripts/usb-lab.py validate profiles/valid/minimal-device.json --mode strict
+python3 scripts/usb-lab.py generate --type hid --count 10 --seed 42 --mode safe --out-dir profiles/generated/hid-session
+```
+
+Другие встроенные шаблоны находятся в `profiles/templates/`:
+
+- `hid-mouse.json` — HID Mouse;
+- `cdc-acm-serial.json` — лабораторный профиль CDC ACM;
+- `vendor-bulk.json` — vendor-specific Bulk;
+- `msc-bot-descriptor-only.json` — только дескрипторы Mass Storage; полноценный BOT/SCSI накопитель не реализован.
+
+Полезные документы:
+
+- [Захват Wireshark при ограничении «только Wireshark на Windows»](docs/wireshark-only-host.md)
+- [Архитектура проекта](docs/architecture.md)
+- [Ограничения Windows](docs/windows10.md)
+- [Сбор host logs для другой конфигурации стенда](docs/host-log-collection.md) — не требуется при использовании только Wireshark на Windows.
+
+Полезные внешние документы:
+
+- [Linux USB Raw Gadget](https://docs.kernel.org/usb/raw-gadget.html)
+- [Linux USB Gadget API](https://docs.kernel.org/driver-api/usb/gadget.html)
+- [Wireshark USB capture](https://wiki.wireshark.org/CaptureSetup/USB)
+- [USB 2.0 Specification](https://www.usb.org/document-library/usb-20-specification)
